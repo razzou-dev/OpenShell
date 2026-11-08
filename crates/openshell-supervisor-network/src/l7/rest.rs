@@ -3116,13 +3116,14 @@ fn detect_payload_mode(headers: &str) -> Result<SigV4PayloadMode> {
             };
         }
     }
-    Ok(
-        if matches!(parse_body_length(headers)?, BodyLength::ContentLength(_)) {
-            SigV4PayloadMode::SignBody
-        } else {
-            SigV4PayloadMode::UnsignedPayload
-        },
-    )
+    // A request without a body (GET, HEAD, most DELETEs) is signed with the
+    // empty-body hash: only S3 accepts UNSIGNED-PAYLOAD, and clients such as the
+    // AWS CLI send x-amz-content-sha256, read above, only to S3. A chunked body
+    // cannot be buffered for its hash, so it streams as UNSIGNED-PAYLOAD.
+    Ok(match parse_body_length(headers)? {
+        BodyLength::ContentLength(_) | BodyLength::None => SigV4PayloadMode::SignBody,
+        BodyLength::Chunked => SigV4PayloadMode::UnsignedPayload,
+    })
 }
 
 /// Parse Content-Length or Transfer-Encoding from HTTP headers.
@@ -11066,8 +11067,26 @@ mod tests {
     }
 
     #[test]
-    fn detect_payload_mode_absent_without_content_length() {
+    fn detect_payload_mode_absent_without_body_signs_empty_body() {
+        // The AWS CLI sends no x-amz-content-sha256 to services other than S3:
+        // their GETs must be signed with the empty-body hash, which they require.
+        let headers =
+            "GET /2015-03-31/functions/ HTTP/1.1\r\nHost: lambda.us-east-1.amazonaws.com\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::SignBody
+        );
+        // S3 accepts the empty-body hash as well.
         let headers = "GET /bucket HTTP/1.1\r\nHost: s3.amazonaws.com\r\n\r\n";
+        assert_eq!(
+            detect_payload_mode(headers).unwrap(),
+            SigV4PayloadMode::SignBody
+        );
+    }
+
+    #[test]
+    fn detect_payload_mode_absent_with_chunked_body_streams_unsigned() {
+        let headers = "PUT /bucket/key HTTP/1.1\r\nHost: s3.us-east-1.amazonaws.com\r\nTransfer-Encoding: chunked\r\n\r\n";
         assert_eq!(
             detect_payload_mode(headers).unwrap(),
             SigV4PayloadMode::UnsignedPayload
